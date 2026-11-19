@@ -69,6 +69,8 @@ class Cursor {
     if (char === '.' && this.text.slice(this.at, this.at + 3) === '...') return '...';
     if (char === '"') return '"';
     if (char === '$') return '$';
+    const number = /^-?[0-9]+/.exec(this.text.slice(this.at));
+    if (number !== null && number[0] !== '') return number[0];
     const match = /^[A-Za-z_][A-Za-z_0-9]*/.exec(this.text.slice(this.at));
     if (match !== null) return match[0];
     return char;
@@ -155,7 +157,9 @@ function parseSelectionSet(cursor: Cursor): Selection[] {
       for (;;) {
         if (cursor.eat(')')) break;
         const argName = cursor.take();
-        if (argName === null || !cursor.eat(':')) throw new Error('an argument names a value');
+        if (argName === null || !cursor.eat(':')) {
+          throw new Error(`an argument names a value (at ${cursor.at}, arg ${JSON.stringify(argName)}, next ${JSON.stringify(cursor.text.slice(cursor.at, cursor.at + 24))})`);
+        }
         args.push({ name: argName, value: parseValue(cursor) });
       }
     }

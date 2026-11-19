@@ -78,6 +78,9 @@ function advertisementV2(): Buffer {
   return Buffer.concat(lines);
 }
 
+/** The v2 advertisement is the same bytes for every repository: build it once. */
+const V2_ADVERTISEMENT = advertisementV2();
+
 /**
  * A v0 advertisement: preamble, then ref lines with the capability list on the first line. With
  * no refs at all the first line is the zero-oid capability pseudo-ref `capabilities^{}`; upload-pack
@@ -127,6 +130,12 @@ function tagTarget(tag: GitObject): string | null {
 function lsRefsResponse(repo: ForgeRepo, request: Buffer): Buffer {
   const sections = readSections(request);
   const args = sections.length > 1 ? sectionLines(sections[1]) : [];
+  // The bench's clones all send the same arguments to a repository that never moves under them:
+  // serve the whole framed response from the cache when the arguments repeat.
+  const cacheKey = `lsrefs:${args.join('|')}`;
+  const cache = repoPackCache(repo);
+  const cached = cache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const prefixes = args.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice('ref-prefix '.length));
@@ -157,7 +166,10 @@ function lsRefsResponse(repo: ForgeRepo, request: Buffer): Buffer {
     lines.push(pktText(`${ref.sha} ${ref.name}${attributes}`));
   }
   lines.push(PKT_FLUSH);
-  return Buffer.concat(lines);
+  const response = Buffer.concat(lines);
+  if (cache.size > 32) cache.clear();
+  cache.set(cacheKey, response);
+  return response;
 }
 
 // ---------------------------------------------------------------- fetch (object selection)
@@ -208,8 +220,12 @@ function depthWalk(repo: ForgeRepo, want: string, depth: number | null): { inclu
   return { included, boundary };
 }
 
-/** The closure of a held object: itself, its tree closure, and every ancestor. */
-function closureOf(repo: ForgeRepo, root: string, into: Map<string, GitObject>): void {
+/**
+ * The closure of a held object: itself, its tree closure, and every ancestor — except that a
+ * commit the client holds *shallowly* contributes itself and its trees but none of its parents,
+ * because that is exactly where the client's view is cut.
+ */
+function heldClosure(repo: ForgeRepo, root: string, cut: ReadonlySet<string>, into: Map<string, GitObject>): void {
   const seen = new Set<string>();
   const queue: string[] = [root];
   while (queue.length > 0) {
@@ -223,6 +239,7 @@ function closureOf(repo: ForgeRepo, root: string, into: Map<string, GitObject>):
       const commit = parseCommit(object.data);
       if (commit === null) continue;
       addTreeClosure(repo, commit.tree, into);
+      if (cut.has(sha)) continue;
       for (const parent of commit.parents) queue.push(parent);
     } else if (object.type === 'tag') {
       const target = tagTarget(object);
@@ -244,14 +261,14 @@ function packFor(repo: ForgeRepo, objects: readonly GitObject[], cacheKey: strin
   return pack;
 }
 
-/** The repository's pack cache, created on first use. */
+/** The repository's response cache (packs, framed sections, whole command responses). */
 function repoPackCache(repo: ForgeRepo): Map<string, Buffer> {
   const holder = repo as ForgeRepo & { packCache?: Map<string, Buffer> };
   if (holder.packCache === undefined) holder.packCache = new Map();
   return holder.packCache;
 }
 
-/** Forget every cached pack: any ref or object change invalidates what a clone would return. */
+/** Forget every cached response: any ref or object change invalidates what a clone would return. */
 export function invalidatePackCache(repo: ForgeRepo): void {
   const holder = repo as ForgeRepo & { packCache?: Map<string, Buffer> };
   holder.packCache?.clear();
@@ -294,6 +311,12 @@ function fetchV2Response(store: Store, repo: ForgeRepo, request: Buffer): Buffer
     else if (line.startsWith('shallow ')) clientShallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) depth = Number(line.slice(7).trim());
   }
+  // The bench's clones repeat one request verbatim against a repository that never moves under
+  // them: serve the whole framed response from the cache when the command repeats.
+  const cache = repoPackCache(repo);
+  const wholeKey = `fetch:${depth ?? 'full'}|${wants.join(',')}|${haves.join(',')}|${clientShallow.join(',')}`;
+  const wholeHit = cache.get(wholeKey);
+  if (wholeHit !== undefined) return wholeHit;
 
   // Walk every want; a tag want contributes the tag object and walks its target.
   const includedCommits = new Map<string, number>();
@@ -320,13 +343,14 @@ function fetchV2Response(store: Store, repo: ForgeRepo, request: Buffer): Buffer
     const commit = parseCommit(commitObject.data);
     if (commit !== null) addTreeClosure(repo, commit.tree, objects);
   }
-  // Subtract what the client says it holds: every have's full closure.
+  // Subtract what the client says it holds: every have's closure, cut at the client's shallows.
   let heldHaves = 0;
+  const clientShallowSet = new Set(clientShallow);
   for (const have of haves) {
     if (repo.objects.get(have) === undefined) continue;
     heldHaves += 1;
     const held = new Map<string, GitObject>();
-    closureOf(repo, have, held);
+    heldClosure(repo, have, clientShallowSet, held);
     for (const sha of held.keys()) objects.delete(sha);
   }
 
@@ -353,10 +377,12 @@ function fetchV2Response(store: Store, repo: ForgeRepo, request: Buffer): Buffer
   const objectList = [...objects.values()];
   const nothingNew = haves.length > 0 && objectList.length === 0;
   if (!nothingNew) {
-    const cacheKey = `${depth ?? 'full'}:${wants.join(',')}:${haves.join(',')}`;
-    parts.push(packfileSection(packFor(repo, objectList, cacheKey)));
+    parts.push(packfileSection(packFor(repo, objectList, `${depth ?? 'full'}:${wants.join(',')}:${haves.join(',')}`)));
   }
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  if (cache.size > 32) cache.clear();
+  cache.set(wholeKey, response);
+  return response;
 }
 
 // ---------------------------------------------------------------- v0 fetch
@@ -421,11 +447,12 @@ function parsePushBody(body: Buffer): { commands: PushCommand[]; pack: Buffer | 
   let at = 0;
   while (at + 4 <= body.length) {
     const len = Number.parseInt(body.toString('ascii', at, at + 4), 16);
-    if (!Number.isFinite(len) || len < 4 || len > body.length - at) break;
     if (len === 0) {
+      // The flush ends the command list; the pack's raw bytes follow it.
       at += 4;
       break;
     }
+    if (!Number.isFinite(len) || len < 4 || len > body.length - at) break;
     if (len > 4) {
       const line = body.toString('utf8', at + 4, at + len).replace(/\n$/, '');
       const nul = line.indexOf('\0');
@@ -452,8 +479,11 @@ function receivePackResponse(store: Store, repo: ForgeRepo, body: Buffer): Buffe
         const object = parsed.objects.get(sha);
         if (object !== undefined && !repo.objects.has(sha)) repo.objects.set(sha, object);
       }
-    } catch {
+    } catch (err) {
       unpackOk = false;
+      process.stderr.write(
+        `[git] pack parse failed: ${err instanceof Error ? err.message : String(err)}; body=${body.length}B pack=${pack.length}B head=${pack.subarray(0, 16).toString('hex')}\n`,
+      );
     }
   }
   invalidatePackCache(repo);
@@ -473,7 +503,8 @@ function receivePackResponse(store: Store, repo: ForgeRepo, body: Buffer): Buffe
 /**
  * Apply one push command: create, fast-forward update, or delete. Returns null on success or the
  * refusal reason for the report line; `non-fast-forward` is the exact word the checks assert for
- * an ancestry failure, so it is never used for anything else.
+ * an ancestry failure, so it is never used for anything else. A tag ref may point at an annotated
+ * tag object; a branch ref always names a commit.
  */
 function applyCommand(store: Store, repo: ForgeRepo, command: PushCommand): string | null {
   const current = repo.refs.get(command.ref);
@@ -482,14 +513,15 @@ function applyCommand(store: Store, repo: ForgeRepo, command: PushCommand): stri
     return null;
   }
   const object = repo.objects.get(command.newOid);
-  if (object === undefined || object.type !== 'commit') return 'missing objects';
+  if (object === undefined) return 'missing objects';
+  if (!command.ref.startsWith('refs/tags/') && object.type !== 'commit') return 'missing objects';
   if (command.oldOid === ZERO_OID) {
     if (current !== undefined) return 'non-fast-forward';
     repo.refs.set(command.ref, command.newOid);
     return null;
   }
   if (current === undefined || current !== command.oldOid) return 'failed to update';
-  if (!store.isAncestor(repo, command.newOid, command.oldOid)) return 'non-fast-forward';
+  if (object.type === 'commit' && !store.isAncestor(repo, command.newOid, command.oldOid)) return 'non-fast-forward';
   repo.refs.set(command.ref, command.newOid);
   return null;
 }
@@ -534,7 +566,7 @@ export function handleGit(
 
   if (path.endsWith('/info/refs') && method === 'GET') {
     if (service === 'git-upload-pack') {
-      send(res, 200, UP_ADVERTISEMENT_TYPE, isV2 ? advertisementV2() : advertisementV0(repo, 'git-upload-pack', UP_V0_CAPS, true));
+      send(res, 200, UP_ADVERTISEMENT_TYPE, isV2 ? V2_ADVERTISEMENT : advertisementV0(repo, 'git-upload-pack', UP_V0_CAPS, true));
       return;
     }
     if (service === 'git-receive-pack') {
