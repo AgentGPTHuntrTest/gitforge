@@ -4,7 +4,7 @@
 // GraphQL-level errors — HTTP 200 with an errors array naming the field; unknown repositories are
 // `data.repository: null` with no errors; an array body is operation batching, answered in order.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { HttpResponse } from './http-shim.ts';
 
 import { FORGE_LOGIN } from './env.ts';
 import { sendJson } from './http-util.ts';
@@ -625,8 +625,7 @@ function runOperation(store: Store, query: unknown, variables: unknown): Record<
 }
 
 /** Serve POST /api/graphql: one operation or an array of them, answered in order. */
-export function handleGraphql(store: Store, req: IncomingMessage, res: ServerResponse, body: Buffer): void {
-  void req;
+export function handleGraphql(store: Store, res: HttpResponse, body: Buffer): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body.toString('utf8'));

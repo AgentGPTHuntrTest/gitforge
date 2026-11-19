@@ -5,17 +5,16 @@
 // anything the token cannot see (never 403), 400 for a malformed body, 409 for a stale blob sha,
 // 422 for a duplicate name or an unknown label, and one JSON body shape per entity everywhere.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { type HttpRequest, HttpResponse, QueryMap } from './http-shim.ts';
 
 import { FORGE_LOGIN, NOW_ISO } from './env.ts';
-import { nextRequestId, sendJson } from './http-util.ts';
+import { errorMessage, nextRequestId, sendJson } from './http-util.ts';
 import { lineCount, diffTrees, pullConflicts, squashMerge } from './merge.ts';
 import {
   branchJson,
   commentJson,
   commitJson,
   dirEntryJson,
-  errorMessage,
   fileJson,
   issueJson,
   labelFullJson,
@@ -55,7 +54,7 @@ function invalidateIssue(repo: ForgeRepo, issueId?: number): void {
 }
 
 /** Parse a JSON request body, or answer 400 the way the protocol check wants. */
-function jsonBody(res: ServerResponse, body: Buffer): Record<string, unknown> | null {
+function jsonBody(res: HttpResponse, body: Buffer): Record<string, unknown> | null {
   if (body.length === 0) return {};
   try {
     const parsed: unknown = JSON.parse(body.toString('utf8'));
@@ -77,7 +76,7 @@ function str(source: Record<string, unknown>, key: string): string | undefined {
 }
 
 /** The repository a route names, or a 404 and null (another owner's name is a 404 too). */
-function findRepo(store: Store, res: ServerResponse, owner: string, name: string): ForgeRepo | null {
+function findRepo(store: Store, res: HttpResponse, owner: string, name: string): ForgeRepo | null {
   const repo = store.getRepo(owner, name);
   if (repo === null) {
     sendJson(res, 404, errorMessage('Not Found'));
@@ -87,15 +86,15 @@ function findRepo(store: Store, res: ServerResponse, owner: string, name: string
 }
 
 /** A positive page size from a query string, or the default. */
-function pageSize(url: URL, fallback: number, cap = 100): number {
-  const raw = Number(url.searchParams.get('per_page'));
+function pageSize(query: QueryMap, fallback: number, cap = 100): number {
+  const raw = Number(query.get('per_page'));
   if (!Number.isFinite(raw) || raw <= 0) return fallback;
   return Math.min(Math.floor(raw), cap);
 }
 
 /** The sha a ref-ish query parameter names: a branch, a full ref, or a commit sha itself. */
-function refOfParam(repo: ForgeRepo, url: URL, param = 'ref'): string | null {
-  const ref = url.searchParams.get(param);
+function refOfParam(repo: ForgeRepo, query: QueryMap, param = 'ref'): string | null {
+  const ref = query.get(param);
   if (ref === null || ref === '') return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? null;
   const full = ref.startsWith('refs/') ? ref : `refs/heads/${ref}`;
   const byRef = repo.refs.get(full);
@@ -142,7 +141,7 @@ function advanceRef(store: Store, repo: ForgeRepo, branch: string | undefined, n
  * Serve one /api/v3 request; the router has already authenticated it, resolved the prefix, and
  * read the whole body. `sub` is the path after `/api/v3` (empty or `/` for the root).
  */
-export function handleRest(store: Store, req: IncomingMessage, res: ServerResponse, url: URL, sub: string, body: Buffer): void {
+export function handleRest(store: Store, req: HttpRequest, res: HttpResponse, query: QueryMap, sub: string, body: Buffer): void {
   const method = req.method ?? 'GET';
   const segments = sub.split('/').filter((part) => part !== '').map((part) => {
     try {
@@ -199,14 +198,14 @@ export function handleRest(store: Store, req: IncomingMessage, res: ServerRespon
       return;
     }
     if (method === 'GET') {
-      const perPage = pageSize(url, 30);
-      const page = Math.max(1, Math.floor(Number(url.searchParams.get('page')) || 1));
+      const perPage = pageSize(query, 30);
+      const page = Math.max(1, Math.floor(Number(query.get('page')) || 1));
       const all = [...store.repos.values()].filter((repo) => repo.owner === FORGE_LOGIN);
       const start = (page - 1) * perPage;
       const pageItems = all.slice(start, start + perPage);
       const headers: Record<string, string> = {};
       if (start + perPage < all.length) {
-        const host = (req.headers.host as string | undefined) ?? 'forge.local';
+        const host = req.headers.host ?? 'forge.local';
         const link = nextPageLink(host, '/api/v3/user/repos', { page: String(page + 1), per_page: String(perPage) });
         if (link !== null) headers.link = link;
       }
@@ -302,7 +301,7 @@ export function handleRest(store: Store, req: IncomingMessage, res: ServerRespon
   }
 
   if (rest[0] === 'commits' && rest.length === 1 && method === 'GET') {
-    const tip = refOfParam(repo, url, 'sha');
+    const tip = refOfParam(repo, query, 'sha');
     if (tip === null) {
       sendJson(res, 404, errorMessage('Not Found'));
       return;
@@ -312,7 +311,7 @@ export function handleRest(store: Store, req: IncomingMessage, res: ServerRespon
   }
 
   if (rest[0] === 'contents' && rest.length >= 2) {
-    handleContents(store, req, res, url, repo, rest.slice(1), body);
+    handleContents(store, req, res, query, repo, rest.slice(1), body);
     return;
   }
 
@@ -339,7 +338,7 @@ export function handleRest(store: Store, req: IncomingMessage, res: ServerRespon
   }
 
   if (rest[0] === 'issues' && rest.length === 1) {
-    handleIssueList(store, res, url, repo, body, method);
+    handleIssueList(store, res, query, repo, body, method);
     return;
   }
 
@@ -406,7 +405,7 @@ export function handleRest(store: Store, req: IncomingMessage, res: ServerRespon
   }
 
   if (rest[0] === 'pulls' && rest.length === 1) {
-    handlePullList(store, res, url, repo, body, method);
+    handlePullList(store, res, query, repo, body, method);
     return;
   }
 
@@ -466,7 +465,7 @@ export function handleRest(store: Store, req: IncomingMessage, res: ServerRespon
 }
 
 /** The issues route: list with state/sort/direction filters, or create with label validation. */
-function handleIssueList(store: Store, res: ServerResponse, url: URL, repo: ForgeRepo, body: Buffer, method: string): void {
+function handleIssueList(store: Store, res: HttpResponse, query: QueryMap, repo: ForgeRepo, body: Buffer, method: string): void {
   if (method === 'POST') {
     const parsed = jsonBody(res, body);
     if (parsed === null) return;
@@ -488,9 +487,9 @@ function handleIssueList(store: Store, res: ServerResponse, url: URL, repo: Forg
     return;
   }
   if (method === 'GET') {
-    const stateParam = url.searchParams.get('state') ?? 'open';
-    const direction = url.searchParams.get('direction') === 'asc' ? 'asc' : 'desc';
-    const perPage = pageSize(url, 30);
+    const stateParam = query.get('state') ?? 'open';
+    const direction = query.get('direction') === 'asc' ? 'asc' : 'desc';
+    const perPage = pageSize(query, 30);
     let issues = repo.issues.filter((issue) => (stateParam === 'all' ? true : issue.state === stateParam));
     issues = [...issues].sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
     sendJson(res, 200, issues.slice(0, perPage).map((issue) => issueJson(repo, issue)));
@@ -500,7 +499,7 @@ function handleIssueList(store: Store, res: ServerResponse, url: URL, repo: Forg
 }
 
 /** The pulls route: list with a state filter (default open), or create with tip snapshots. */
-function handlePullList(store: Store, res: ServerResponse, url: URL, repo: ForgeRepo, body: Buffer, method: string): void {
+function handlePullList(store: Store, res: HttpResponse, query: QueryMap, repo: ForgeRepo, body: Buffer, method: string): void {
   if (method === 'POST') {
     const parsed = jsonBody(res, body);
     if (parsed === null) return;
@@ -520,8 +519,8 @@ function handlePullList(store: Store, res: ServerResponse, url: URL, repo: Forge
     return;
   }
   if (method === 'GET') {
-    const stateParam = url.searchParams.get('state') ?? 'open';
-    const perPage = pageSize(url, 30);
+    const stateParam = query.get('state') ?? 'open';
+    const perPage = pageSize(query, 30);
     const pulls = repo.pulls.filter((pull) => (stateParam === 'all' ? true : stateParam === 'closed' ? pull.state === 'closed' : pull.state === 'open'));
     sendJson(res, 200, [...pulls].sort((a, b) => a.number - b.number).slice(0, perPage).map((pull) => pullJson(pull)));
     return;
@@ -580,9 +579,9 @@ function blobAt(repo: ForgeRepo, commitSha: string, path: string): { sha: string
 /** The contents route: read a file or a directory, create and update files, delete them. */
 function handleContents(
   store: Store,
-  req: IncomingMessage,
-  res: ServerResponse,
-  url: URL,
+  req: HttpRequest,
+  res: HttpResponse,
+  query: QueryMap,
   repo: ForgeRepo,
   pathSegments: readonly string[],
   body: Buffer,
@@ -595,7 +594,7 @@ function handleContents(
   }
 
   if (method === 'GET') {
-    const tip = refOfParam(repo, url);
+    const tip = refOfParam(repo, query);
     if (tip === null) {
       sendJson(res, 404, errorMessage('Not Found'));
       return;

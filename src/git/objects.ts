@@ -3,7 +3,7 @@
 // "<type> <size>\0<content>", tree entries in git's raw binary layout, commit headers in git's
 // header order. No git binary exists in the trial, so this file *is* the object database's grammar.
 
-import { createHash } from 'node:crypto';
+import { createHash, hash as oneShotHash } from 'node:crypto';
 
 /** The four object types a loose store holds; git's pack format numbers them 1..4 in this order. */
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
@@ -33,6 +33,10 @@ export interface GitObject {
 /** The sha1 of an object as git computes it: over "<type> <size>\0" then the payload. */
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
+  // One-shot hashing where it exists: one digest call, no hash object created per entry.
+  if (typeof oneShotHash === 'function') {
+    return oneShotHash('sha1', Buffer.concat([header, data as Uint8Array], header.length + data.byteLength));
+  }
   return createHash('sha1').update(header).update(data).digest('hex');
 }
 

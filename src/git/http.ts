@@ -5,7 +5,7 @@
 // the boundary `shallow`, and lifts old boundaries with `unshallow`; pushes are fast-forward-checked
 // per command and reported ok/ng inside sideband band 1, refused commands never moving a ref.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { type HttpRequest, HttpResponse, QueryMap } from '../http-shim.ts';
 
 import { Store, type ForgeRepo } from '../store.ts';
 import { parseCommit, parseTree, MODE_TREE, type GitObject } from './objects.ts';
@@ -53,7 +53,7 @@ function headSha(repo: ForgeRepo): string | null {
 }
 
 /** Send bytes with a content type; git clients want the body whole. */
-function send(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+function send(res: HttpResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
   res.end(body);
 }
@@ -553,15 +553,15 @@ function firstDataLine(body: Buffer): string {
  */
 export function handleGit(
   store: Store,
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: HttpRequest,
+  res: HttpResponse,
   repo: ForgeRepo,
-  url: URL,
+  query: QueryMap,
   body: Buffer,
 ): void {
-  const path = url.pathname;
+  const path = req.path;
   const method = req.method ?? 'GET';
-  const service = url.searchParams.get('service') ?? '';
+  const service = query.get('service') ?? '';
   const isV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
 
   if (path.endsWith('/info/refs') && method === 'GET') {

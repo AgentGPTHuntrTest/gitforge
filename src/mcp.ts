@@ -5,7 +5,7 @@
 // their ids unchanged. Errors are JSON-RPC errors, never HTTP 500; a malformed body is 400 with
 // -32700; no session id is ever issued (the client would then have to carry and delete it).
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { HttpResponse } from './http-shim.ts';
 
 import { FORGE_LOGIN } from './env.ts';
 import { sendJson } from './http-util.ts';
@@ -223,8 +223,7 @@ function callTool(store: Store, id: unknown, name: string, args: Record<string, 
 }
 
 /** Serve POST /mcp; the router has already authenticated the request and read the body whole. */
-export function handleMcp(store: Store, req: IncomingMessage, res: ServerResponse, body: Buffer): void {
-  void req;
+export function handleMcp(store: Store, res: HttpResponse, body: Buffer): void {
   let text: string;
   try {
     text = body.toString('utf8');
