@@ -1,9 +1,11 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// port it bound, then poll until the env says the trial is over and exit 0. Keep this file's
+// lifecycle; the suite scores the server app.ts builds, and the lifecycle is the harness's, not the
+// contest's.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
+//      the program exits 1 at once — unless FORGE_PORT is set, the standalone mode a local
+//      conformance run uses: serve on that port and never register or poll.
 //   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
 //   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
 //      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
@@ -13,16 +15,12 @@
 //      is retried with a short exponential backoff; the process never exits before the env says done.
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
-//
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
 import { createApp } from './app.ts';
+import { Store } from './src/store.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (ENV_URL === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
-  process.exit(1);
-}
+const STANDALONE_PORT = Number(process.env.FORGE_PORT);
 
 /** How long one register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -78,14 +76,23 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
-  const server = createApp();
+  const store = new Store();
+  const server = createApp(store);
+  const standalone = ENV_URL === '' && Number.isInteger(STANDALONE_PORT) && STANDALONE_PORT > 0;
+  const port = standalone ? STANDALONE_PORT : 0;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, () => resolve());
+    server.listen(port, () => resolve());
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
+
+  if (standalone) {
+    // A local conformance run: serve until the harness stops the process.
+    process.stdout.write('[entry] standalone mode: serving, no env to wait for\n');
+    return;
+  }
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
@@ -97,7 +104,7 @@ async function main(): Promise<void> {
 
 try {
   await main();
-  process.exit(0);
+  if (ENV_URL !== '') process.exit(0);
 } catch (err) {
   process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
