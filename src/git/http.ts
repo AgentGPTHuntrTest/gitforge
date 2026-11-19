@@ -82,6 +82,22 @@ function advertisementV2(): Buffer {
 const V2_ADVERTISEMENT = advertisementV2();
 
 /**
+ * A v0 advertisement, cached per repository and service: it is a pure function of the ref set,
+ * and the ref set only changes in the same synchronous turn that clears this cache. The push
+ * workload fetches one before every receive-pack; the clone workload three times a clone.
+ */
+function advertisementV0Cached(repo: ForgeRepo, service: string, caps: string, withHead: boolean): Buffer {
+  const cache = repoPackCache(repo);
+  const key = `adv0:${service}:${withHead ? 'head' : 'nohead'}`;
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const built = advertisementV0(repo, service, caps, withHead);
+  if (cache.size > 32) cache.clear();
+  cache.set(key, built);
+  return built;
+}
+
+/**
  * A v0 advertisement: preamble, then ref lines with the capability list on the first line. With
  * no refs at all the first line is the zero-oid capability pseudo-ref `capabilities^{}`; upload-pack
  * leads with HEAD (carrying the capabilities), receive-pack never lists HEAD.
@@ -566,11 +582,11 @@ export function handleGit(
 
   if (path.endsWith('/info/refs') && method === 'GET') {
     if (service === 'git-upload-pack') {
-      send(res, 200, UP_ADVERTISEMENT_TYPE, isV2 ? V2_ADVERTISEMENT : advertisementV0(repo, 'git-upload-pack', UP_V0_CAPS, true));
+      send(res, 200, UP_ADVERTISEMENT_TYPE, isV2 ? V2_ADVERTISEMENT : advertisementV0Cached(repo, 'git-upload-pack', UP_V0_CAPS, true));
       return;
     }
     if (service === 'git-receive-pack') {
-      send(res, 200, RP_ADVERTISEMENT_TYPE, advertisementV0(repo, 'git-receive-pack', RP_CAPS, false));
+      send(res, 200, RP_ADVERTISEMENT_TYPE, advertisementV0Cached(repo, 'git-receive-pack', RP_CAPS, false));
       return;
     }
     send(res, 404, 'text/plain', Buffer.from('no such service\n'));

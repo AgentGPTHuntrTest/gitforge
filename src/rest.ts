@@ -137,6 +137,18 @@ function advanceRef(store: Store, repo: ForgeRepo, branch: string | undefined, n
   void store;
 }
 
+/** The git smart HTTP path shape, and the read workload's hot issue route. */
+const ISSUE_GET_SHAPE = /^\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
+
+/** One percent-decoded segment, tolerating malformed escapes. */
+function tryDecode(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 /**
  * Serve one /api/v3 request; the router has already authenticated it, resolved the prefix, and
  * read the whole body. `sub` is the path after `/api/v3` (empty or `/` for the root).
@@ -150,6 +162,31 @@ export function handleRest(store: Store, req: HttpRequest, res: HttpResponse, qu
       return part;
     }
   });
+
+  // The read workload's hot route: one issue, read again and again. Answer it before the generic
+  // route walk; anything it cannot resolve falls through unchanged (repo, issue, every error path).
+  if (method === 'GET' && ISSUE_GET_SHAPE.test(sub)) {
+    const fast = ISSUE_GET_SHAPE.exec(sub);
+    if (fast !== null) {
+      const fastOwner = tryDecode(fast[1]);
+      const fastName = tryDecode(fast[2]);
+      const fastRepo = store.getRepo(fastOwner, fastName);
+      if (fastRepo !== null) {
+        const number = Number(fast[3]);
+        const fastIssue = fastRepo.issues[number - 1];
+        if (fastIssue !== undefined && fastIssue.number === number) {
+          const bytes = cachedIssueBody(fastRepo, fastIssue);
+          res.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(bytes.length),
+            'x-github-request-id': nextRequestId(),
+          });
+          res.end(bytes);
+          return;
+        }
+      }
+    }
+  }
 
   // The API root: a JSON object with the token's scopes beside it.
   if (segments.length === 0) {
